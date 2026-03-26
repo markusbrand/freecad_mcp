@@ -1,4 +1,5 @@
 from typing import Any, Dict
+import os
 import socket
 import json
 from mcp.server.fastmcp import FastMCP
@@ -6,9 +7,9 @@ from mcp.server.fastmcp import FastMCP
 # Initialize FastMCP server
 mcp = FastMCP("freecad-bridge")
 
-# Constants
-FREECAD_HOST = 'localhost'
-FREECAD_PORT = 9876
+# Avoid localhost → wrong interface; override via mcp.json "env" if needed.
+FREECAD_HOST = os.environ.get("FREECAD_MCP_HOST", "127.0.0.1")
+FREECAD_PORT = int(os.environ.get("FREECAD_MCP_PORT", "9877"))
 
 async def send_to_freecad(command: Dict[str, Any]) -> Dict[str, Any]:
     """Send a command to FreeCAD and get the response."""

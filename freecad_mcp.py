@@ -6,10 +6,16 @@ import socket
 import threading
 import time
 import traceback
-from PySide import QtCore, QtGui
+from PySide import QtCore, QtWidgets
+
+# Single TCP server for MCP (shared by task panel and toolbar commands).
+_mcp_server = None
+
 
 class FreeCADMCPServer:
-    def __init__(self, host='localhost', port=9876):
+    # Default 9877: 9876 is commonly used by Blender MCP; avoid port clash.
+    # 127.0.0.1 matches the Cursor bridge (FREECAD_MCP_HOST).
+    def __init__(self, host="127.0.0.1", port=9877):
         self.host = host
         self.port = port
         self.running = False
@@ -22,15 +28,22 @@ class FreeCADMCPServer:
         self.running = True
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
+
         try:
             self.socket.bind((self.host, self.port))
             self.socket.listen(1)
             self.socket.setblocking(False)
-            self.timer = QtCore.QTimer()
+            # QTimer must belong to the GUI thread / main window or it may never fire in FreeCAD.
+            try:
+                timer_parent = Gui.getMainWindow()
+            except Exception:
+                timer_parent = None
+            self.timer = QtCore.QTimer(timer_parent)
             self.timer.timeout.connect(self._process_server)
-            self.timer.start(100)  # 100ms interval
-            App.Console.PrintMessage(f"FreeCAD MCP server started on {self.host}:{self.port}\n")
+            self.timer.start(100)
+            App.Console.PrintMessage(
+                f"FreeCAD MCP server started on {self.host}:{self.port}\n"
+            )
         except Exception as e:
             App.Console.PrintError(f"Failed to start server: {str(e)}\n")
             self.stop()
@@ -236,48 +249,148 @@ class FreeCADMCPServer:
             "view": view_info
         }
 
+
+def mcp_server_running():
+    global _mcp_server
+    return _mcp_server is not None and getattr(_mcp_server, "socket", None) is not None
+
+
+def _mcp_message_box(title, text, *, error=False):
+    """Visible feedback; Report view is easy to miss."""
+    try:
+        parent = Gui.getMainWindow()
+    except Exception:
+        parent = None
+    box = QtWidgets.QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setIcon(
+        QtWidgets.QMessageBox.Critical
+        if error
+        else QtWidgets.QMessageBox.Information
+    )
+    if hasattr(box, "exec"):
+        box.exec()
+    else:
+        box.exec_()
+
+
+def mcp_server_start(*, show_dialog_on_ok=False):
+    """Start the MCP TCP server (idempotent).
+
+    Returns (ok: bool, message: str) for UI / logging.
+    """
+    global _mcp_server
+    if mcp_server_running():
+        msg = "MCP server is already running."
+        App.Console.PrintMessage(f"FreeCAD {msg}\n")
+        return True, msg
+    try:
+        _mcp_server = FreeCADMCPServer()
+        _mcp_server.start()
+        if _mcp_server.socket is None:
+            _mcp_server = None
+            err = (
+                "Could not listen on 127.0.0.1:9877 (bind failed). "
+                "Another program may be using that port."
+            )
+            App.Console.PrintError(err + "\n")
+            return False, err
+        ok_msg = f"Listening on {_mcp_server.host}:{_mcp_server.port}"
+        App.Console.PrintMessage(ok_msg + "\n")
+        if show_dialog_on_ok:
+            _mcp_message_box("FreeCAD MCP", ok_msg, error=False)
+        return True, ok_msg
+    except Exception as e:
+        _mcp_server = None
+        App.Console.PrintError(f"MCP start error: {e}\n")
+        traceback.print_exc()
+        return False, str(e)
+
+
+def mcp_server_stop(*, show_dialog=False):
+    """Stop the MCP TCP server. Returns (ok, message)."""
+    global _mcp_server
+    if _mcp_server is None:
+        msg = "MCP server was not running."
+        if show_dialog:
+            _mcp_message_box("FreeCAD MCP", msg, error=False)
+        return False, msg
+    _mcp_server.stop()
+    _mcp_server = None
+    msg = "MCP server stopped."
+    App.Console.PrintMessage(msg + "\n")
+    if show_dialog:
+        _mcp_message_box("FreeCAD MCP", msg, error=False)
+    return True, msg
+
+
 class FreeCADMCPPanel:
+    """Task panel: must use QtWidgets + getStandardButtons() or the combo view stays blank."""
+
     def __init__(self):
-        self.form = QtGui.QWidget()
+        self.form = QtWidgets.QWidget()
         self.form.setWindowTitle("FreeCAD MCP")
-        
-        layout = QtGui.QVBoxLayout(self.form)
-        
-        # Server status
-        self.status_label = QtGui.QLabel("Server: Stopped")
+        self.form.setMinimumWidth(280)
+
+        layout = QtWidgets.QVBoxLayout(self.form)
+
+        self.help_label = QtWidgets.QLabel(
+            "Start the server so Cursor (MCP bridge on port 9877) can run scripts in FreeCAD.\n"
+            "You can also use the toolbar: Start MCP / Stop MCP."
+        )
+        self.help_label.setWordWrap(True)
+        layout.addWidget(self.help_label)
+
+        self.status_label = QtWidgets.QLabel("Server: Stopped")
         layout.addWidget(self.status_label)
-        
-        # Start/Stop buttons
-        button_layout = QtGui.QHBoxLayout()
-        self.start_button = QtGui.QPushButton("Start Server")
-        self.stop_button = QtGui.QPushButton("Stop Server")
+
+        button_layout = QtWidgets.QHBoxLayout()
+        self.start_button = QtWidgets.QPushButton("Start Server")
+        self.stop_button = QtWidgets.QPushButton("Stop Server")
         self.stop_button.setEnabled(False)
-        
-        self.start_button.clicked.connect(self.start_server)
-        self.stop_button.clicked.connect(self.stop_server)
-        
+
+        # QueuedConnection avoids lost clicks when the task panel opens in the same event loop tick.
+        self.start_button.clicked.connect(
+            self.start_server, QtCore.Qt.QueuedConnection
+        )
+        self.stop_button.clicked.connect(
+            self.stop_server, QtCore.Qt.QueuedConnection
+        )
+
         button_layout.addWidget(self.start_button)
         button_layout.addWidget(self.stop_button)
         layout.addLayout(button_layout)
-        
-        # Server instance
-        self.server = None
-        
-    def start_server(self):
-        if not self.server:
-            self.server = FreeCADMCPServer()
-            self.server.start()
-            self.status_label.setText("Server: Running")
+
+        self._sync_ui_from_server()
+
+    def getStandardButtons(self):
+        return QtWidgets.QDialogButtonBox.Close
+
+    def _sync_ui_from_server(self):
+        if mcp_server_running():
+            srv = _mcp_server
+            addr = f"{srv.host}:{srv.port}"
+            self.status_label.setText(f"Server: Running on {addr}")
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
-            
-    def stop_server(self):
-        if self.server:
-            self.server.stop()
-            self.server = None
-            self.status_label.setText("Server: Stopped")
+        else:
+            self.status_label.setText("Server: Stopped (port 9877)")
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
+
+    @QtCore.Slot()
+    def start_server(self):
+        ok, msg = mcp_server_start(show_dialog_on_ok=False)
+        self._sync_ui_from_server()
+        if not ok:
+            _mcp_message_box("FreeCAD MCP — could not start", msg, error=True)
+
+    @QtCore.Slot()
+    def stop_server(self):
+        mcp_server_stop(show_dialog=False)
+        self._sync_ui_from_server()
+
 
 def show_panel():
     panel = FreeCADMCPPanel()
