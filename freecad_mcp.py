@@ -88,6 +88,8 @@ class FreeCADMCPServer:
                                 response = self.execute_command(command)
                                 response_json = json.dumps(response)
                                 self.client.sendall(response_json.encode('utf-8'))
+                                # For MCP, we usually close connection after one command if using short-lived connections
+                                # but the bridge script currently opens/closes per tool call.
                             except json.JSONDecodeError:
                                 pass
                         else:
@@ -120,7 +122,10 @@ class FreeCADMCPServer:
             
             handlers = {
                 "send_command": self.handle_send_command,
-                "run_script": self.handle_run_script
+                "run_script": self.handle_run_script,
+                "get_scene_info": self.handle_get_scene_info,
+                "create_object": self.handle_create_object,
+                "get_object_info": self.handle_get_object_info
             }
             
             handler = handlers.get(cmd_type)
@@ -130,7 +135,7 @@ class FreeCADMCPServer:
                     result = handler(**params)
                     return {"status": "success", "result": result}
                 except Exception as e:
-                    App.Console.PrintError(f"Error in handler: {str(e)}\n")
+                    App.Console.PrintError(f"Error in handler {cmd_type}: {str(e)}\n")
                     traceback.print_exc()
                     return {"status": "error", "message": str(e)}
             else:
@@ -186,6 +191,90 @@ class FreeCADMCPServer:
                 "traceback": traceback.format_exc()
             }
 
+    def handle_get_scene_info(self):
+        """Handle get_scene_info request"""
+        return self.get_document_context()
+
+    def handle_create_object(self, obj_type, obj_name=None, properties=None):
+        """Handle create_object request"""
+        doc = App.ActiveDocument
+        if not doc:
+            doc = App.newDocument("Unnamed")
+
+        if obj_name:
+            obj = doc.addObject(obj_type, obj_name)
+        else:
+            obj = doc.addObject(obj_type)
+
+        if properties:
+            for key, value in properties.items():
+                if hasattr(obj, key):
+                    setattr(obj, key, value)
+
+        doc.recompute()
+
+        return self._get_obj_info_dict(obj)
+
+    def handle_get_object_info(self, obj_name):
+        """Handle get_object_info request"""
+        doc = App.ActiveDocument
+        if not doc:
+            raise Exception("No active document")
+
+        obj = doc.getObject(obj_name)
+        if not obj:
+            # Try by label
+            for o in doc.Objects:
+                if o.Label == obj_name:
+                    obj = o
+                    break
+
+        if not obj:
+            raise Exception(f"Object not found: {obj_name}")
+
+        return self._get_obj_info_dict(obj)
+
+    def _get_obj_info_dict(self, obj):
+        """Internal helper to get object info as a dict"""
+        obj_info = {
+            "name": obj.Name,
+            "label": obj.Label,
+            "type": obj.TypeId,
+            "visibility": obj.ViewObject.Visibility if hasattr(obj, "ViewObject") else None
+        }
+
+        # Add placement
+        if hasattr(obj, "Placement"):
+            pos = obj.Placement.Base
+            rot = obj.Placement.Rotation
+            obj_info["placement"] = {
+                "position": [float(pos.x), float(pos.y), float(pos.z)],
+                "rotation": [float(rot.Axis.x), float(rot.Axis.y), float(rot.Axis.z), float(rot.Angle)]
+            }
+
+        # Add shape properties
+        if hasattr(obj, "Shape"):
+            shape = obj.Shape
+            obj_info["shape"] = {
+                "type": shape.ShapeType,
+                "volume": float(shape.Volume) if hasattr(shape, "Volume") else None,
+                "area": float(shape.Area) if hasattr(shape, "Area") else None,
+                "nb_faces": len(shape.Faces),
+                "nb_edges": len(shape.Edges),
+                "nb_vertexes": len(shape.Vertexes)
+            }
+
+        # Add other common properties
+        for prop in ["Length", "Width", "Height", "Radius", "Angle"]:
+            if hasattr(obj, prop):
+                val = getattr(obj, prop)
+                if hasattr(val, "Value"):
+                    obj_info[prop] = float(val.Value)
+                else:
+                    obj_info[prop] = float(val)
+
+        return obj_info
+
     def get_document_context(self):
         """Get comprehensive information about the current document state"""
         doc = App.ActiveDocument
@@ -199,6 +288,7 @@ class FreeCADMCPServer:
         # Document info
         doc_info = {
             "name": doc.Name,
+            "label": doc.Label,
             "filename": doc.FileName if hasattr(doc, "FileName") else None,
             "object_count": len(doc.Objects)
         }
@@ -206,42 +296,21 @@ class FreeCADMCPServer:
         # Objects info
         objects = []
         for obj in doc.Objects:
-            obj_info = {
-                "name": obj.Name,
-                "label": obj.Label,
-                "type": obj.TypeId,
-                "visibility": obj.ViewObject.Visibility if hasattr(obj, "ViewObject") else None
-            }
-            
-            # Add placement if available
-            if hasattr(obj, "Placement"):
-                pos = obj.Placement.Base
-                rot = obj.Placement.Rotation
-                obj_info["placement"] = {
-                    "position": [float(pos.x), float(pos.y), float(pos.z)],
-                    "rotation": [float(rot.Axis.x), float(rot.Axis.y), float(rot.Axis.z), float(rot.Angle)]
-                }
-            
-            # Add shape properties if available
-            if hasattr(obj, "Shape"):
-                shape = obj.Shape
-                obj_info["shape"] = {
-                    "type": shape.ShapeType,
-                    "volume": float(shape.Volume) if hasattr(shape, "Volume") else None,
-                    "area": float(shape.Area) if hasattr(shape, "Area") else None
-                }
-            
-            objects.append(obj_info)
+            objects.append(self._get_obj_info_dict(obj))
 
         # View state
         view_info = None
         if Gui.ActiveDocument:
-            cam = Gui.ActiveDocument.ActiveView.getCameraNode()
-            view_info = {
-                "camera_type": cam.getTypeId(),
-                "camera_position": [float(x) for x in cam.position.getValue()],
-                "camera_orientation": [float(x) for x in cam.orientation.getValue()]
-            }
+            try:
+                view = Gui.ActiveDocument.ActiveView
+                cam = view.getCameraNode()
+                view_info = {
+                    "camera_type": cam.getTypeId(),
+                    "camera_position": [float(x) for x in cam.position.getValue()],
+                    "camera_orientation": [float(x) for x in cam.orientation.getValue()]
+                }
+            except Exception:
+                pass
 
         return {
             "document": doc_info,

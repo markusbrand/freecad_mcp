@@ -1,8 +1,8 @@
-from blender_mcp.server import main as server_main
+from src.freecad_bridge import mcp
 
 def main():
-    """Entry point for the blender-mcp package"""
-    server_main()
+    """Entry point for the freecad-mcp package"""
+    mcp.run(transport='stdio')
 
 if __name__ == "__main__":
     main()
